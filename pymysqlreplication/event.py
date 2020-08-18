@@ -173,8 +173,11 @@ class QueryEvent(BinLogEvent):
         self.schema = self.packet.read(self.schema_length)
         self.packet.advance(1)
 
+        # Query
+        query_charset_code = self._detect_query_charset_code(self.status_vars)
+        query_encoding_name = self._query_charset_code_to_encoding_name(query_charset_code)
         self.query = self.packet.read(event_size - 13 - self.status_vars_length
-                                      - self.schema_length - 1).decode("utf-8")
+                                      - self.schema_length - 1).decode(query_encoding_name)
         #string[EOF]    query
 
     def _dump(self):
@@ -182,6 +185,75 @@ class QueryEvent(BinLogEvent):
         print("Schema: %s" % (self.schema))
         print("Execution time: %d" % (self.execution_time))
         print("Query: %s" % (self.query))
+
+    def _detect_query_charset_code(self, status_vars):
+        # Reference: mysql-server/libbinlogevents/include/statement_events.h
+
+        buffer = status_vars
+
+        while len(buffer) > 0:
+            code = buffer[0]
+            buffer = buffer[1:]
+            if code in [16]:          # Q_EXPLICIT_DEFAULTS_FOR_TIMESTAMP
+                buffer = buffer[1:]
+            elif code in [7, 8, 18]:  # Q_LC_TIME_NAMES_CODE, Q_CHARSET_DATABASE_CODE, Q_DEFAULT_COLLATION_FOR_UTF8MB4
+                buffer = buffer[2:]
+            elif code in [0, 3, 10]:  # Q_FLAGS2_CODE, Q_AUTO_INCREMENT, Q_MASTER_DATA_WRITTEN_CODE
+                buffer = buffer[4:]
+            elif code in [1, 9, 17]:  # Q_SQL_MODE_CODE, Q_TABLE_MAP_FOR_UPDATE_CODE, Q_DDL_LOGGED_WITH_XID
+                buffer = buffer[8:]
+            elif code in [5, 6]:      # Q_TIME_ZONE_CODE, Q_CATALOG_NZ_CODE
+                l = buffer[0]
+                buffer = buffer[l+1:]
+            elif code == 2:           # Q_CATALOG_CODE
+                l = buffer[0]
+                buffer = buffer[l+2:]
+            elif code == 4:           # Q_CHARSET_CODE
+                return buffer[0] + 256*buffer[1]
+            elif code == 11:          # Q_INVOKER
+                l = buffer[0]
+                buffer = buffer[l+1:]
+                l = buffer[0]
+                buffer = buffer[l+1:]
+            elif code == 12:          # Q_UPDATED_DB_NAMES
+                l = buffer[0]
+                for i in range(0, l):
+                    while buffer[0] > 0:
+                        buffer = buffer[1:]
+                    buffer = buffer[1:]
+            elif code in [13, 14, 15]:  # Q_MICROSECONDS, Q_COMMIT_TS, Q_COMMIT_TS2
+                raise Exception("Old & undocumented, should not have happened!")
+
+        return None
+
+    def _query_charset_code_to_encoding_name(self, query_charset):
+        # References:
+        # * https://dev.mysql.com/doc/refman/8.0/en/charset-charsets.html
+        # * https://dev.mysql.com/doc/refman/5.5/en/charset-charsets.html
+        # * https://docs.python.org/3/library/codecs.html#standard-encodings
+
+        if query_charset:
+            from pymysql.charset import charset_by_id
+            encoding = charset_by_id(query_charset).encoding
+            fix_map = {
+                "dec8": False,
+                "armscii8": False,
+                "keybcs2": False,
+                "hp8": False,
+                "binary": False,
+                "swe7": False,
+                "geostd8": False,
+                "ucs2": False,
+                "eucjpms": "ujis",
+                "koi8u": "koi8_u",
+                "koi8r": "koi8_r",
+                "macce": "maccentraleurope"
+            }
+            if fix_map.get(encoding):
+                return fix_map.get(encoding) or "utf8"
+            return encoding
+        else:
+            return "utf8"
 
 
 class BeginLoadQueryEvent(BinLogEvent):
